@@ -4,9 +4,10 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
-from colossalai.accelerator import get_accelerator
 from colossalai.cluster import DistCoordinator
+from colossalai.utils import get_current_device
 
 
 def divide(x: float, y: float) -> float:
@@ -21,10 +22,67 @@ def divide(x: float, y: float) -> float:
 def all_reduce_mean(x: float, world_size: int) -> float:
     if world_size == 1:
         return x
-    tensor = torch.tensor([x], device=get_accelerator().get_current_device())
+    # BUG: RuntimeError: Invalid scalar type when use dist.all_reduce(tensor, group=gloo_group)
+    # # Use CPU tensor to avoid OOM/weird NCCl error
+    # gloo_group = dist.new_group(backend="gloo")
+    # tensor = torch.tensor([x], device="cpu")
+    # dist.all_reduce(tensor, group=gloo_group)
+    # tensor = tensor / world_size
+    # return tensor.item()
+
+    tensor = torch.tensor([x], device=get_current_device(), dtype=torch.float)
     dist.all_reduce(tensor)
     tensor = tensor / world_size
     return tensor.item()
+
+
+def get_profile_context(enable_flag, warmup_steps, active_steps, save_dir, nsys=False):
+    class DummyProfiler:
+        def __init__(self):
+            self.step_number = 0
+
+        def step(self):
+            self.step_number += 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            pass
+
+    class NsysProfiler:
+        def __init__(self, warmup_steps, active_steps):
+            self.step_number = 0
+            self.warmup_steps = warmup_steps
+            self.active_steps = active_steps
+
+        def step(self):
+            if self.step_number == self.warmup_steps:
+                torch.cuda.cudart().cudaProfilerStart()
+            elif self.step_number == self.warmup_steps + self.active_steps:
+                torch.cuda.cudart().cudaProfilerStop()
+            self.step_number += 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            pass
+
+    if enable_flag:
+        if nsys:
+            return NsysProfiler(warmup_steps, active_steps)
+
+        return profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=0, warmup=warmup_steps, active=active_steps),
+            on_trace_ready=tensorboard_trace_handler(save_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+    else:
+        return DummyProfiler()
 
 
 class Timer:
@@ -85,13 +143,13 @@ class PerformanceEvaluator:
         self.disable = self.ignore_steps > 0 and step < self.ignore_steps
         if self.disable:
             return
-        get_accelerator().synchronize()
+        # get_accelerator().synchronize()
         self.timer.start()
 
     def on_step_end(self, input_ids: Tensor, **kwargs) -> None:
         if self.disable:
             return
-        get_accelerator().synchronize()
+        # get_accelerator().synchronize()
         self.timer.end()
 
         batch_size, seq_len = input_ids.shape
